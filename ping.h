@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <arpa/inet.h>
 
 #define ICMP_ECHO      8
 #define ICMP_ECHOREPLY 0
