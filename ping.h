@@ -5,24 +5,26 @@
 #include <stddef.h>
 #include <arpa/inet.h>
 
+// ICMP type codes
 #define ICMP_ECHO      8
 #define ICMP_ECHOREPLY 0
 
-// ICMP Echo header (RFC 792)
 #if defined(__GNUC__)
 #define PACKED __attribute__((packed))
 #else
 #define PACKED
 #endif
 
+// ICMP Echo hdr (RFC 792)
 typedef struct PACKED {
-    uint8_t  type;      // 8: Echo, 0: Echo Reply
-    uint8_t  code;      // Echo/Echo Reply 0
-    uint16_t checksum;  // 16-bit one's complement
-    uint16_t id;
-    uint16_t seq;
+    uint8_t  type;     // 8=req, 0=reply
+    uint8_t  code;     // 0
+    uint16_t checksum; // 1's comp
+    uint16_t id;       // net order
+    uint16_t seq;      // net order
 } icmp_echo_hdr;
 
+// build + checksum + dump
 uint16_t icmp_checksum(const void *data, size_t len);
 size_t   build_icmp_echo(uint16_t id, uint16_t seq,
                          const uint8_t *payload, size_t payload_len,
