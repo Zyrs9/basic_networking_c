@@ -6,7 +6,7 @@ OBJS    = ping.o
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 ping.o: ping.c ping.h
 	$(CC) $(CFLAGS) -c $<
