@@ -79,10 +79,11 @@ static int resolve_ipv4(const char *host, struct in_addr *out_addr) {
     return 0;
 }
 
-// recv one reply; returns 0 ok, -1 timeout/err
-static int recv_match(int sockfd, uint16_t want_id, uint16_t want_seq,
-                      int timeout_ms, int loose_id, int verbose,
-                      double *out_rtt_ms, char *out_ip, int out_ip_sz, int *out_ttl)
+// recv one reply on RAW sock; returns 0 ok, -1 timeout/err
+static int recv_match_raw(int sockfd, uint16_t want_id, uint16_t want_seq,
+                          int timeout_ms, int loose_id, int verbose,
+                          double *out_rtt_ms, char *out_ip, int out_ip_sz, int *out_ttl,
+                          struct timeval start)
 {
     struct timeval tv = { .tv_sec = timeout_ms / 1000,
                           .tv_usec = (timeout_ms % 1000) * 1000 };
@@ -90,7 +91,6 @@ static int recv_match(int sockfd, uint16_t want_id, uint16_t want_seq,
         perror("setsockopt(SO_RCVTIMEO)"); return -1;
     }
 
-    struct timeval start; gettimeofday(&start, NULL);
     char recvbuf[4096];
     socklen_t alen = sizeof(struct sockaddr_in);
 
@@ -117,12 +117,10 @@ static int recv_match(int sockfd, uint16_t want_id, uint16_t want_seq,
 
         if (verbose) {
             char sip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ip_hdr->saddr, sip, sizeof(sip));
-            printf("[dbg] icmp t=%u c=%u id=0x%04x seq=%u from %s\n", t, c, id, sq, sip);
+            printf("[dbg raw] t=%u c=%u id=0x%04x seq=%u from %s\n", t, c, id, sq, sip);
         }
 
-        if (t == ICMP_ECHOREPLY &&
-            (loose_id || id == want_id) &&
-            sq == want_seq) {
+        if (t == ICMP_ECHOREPLY && (loose_id || id == want_id) && sq == want_seq) {
             struct timeval end; gettimeofday(&end, NULL);
             double rtt = (end.tv_sec - start.tv_sec) * 1000.0 +
                          (end.tv_usec - start.tv_usec) / 1000.0;
@@ -142,7 +140,66 @@ static int recv_match(int sockfd, uint16_t want_id, uint16_t want_seq,
             printf("time exceeded from %s\n", sip);
             return -1;
         }
-        // else: not our reply -> loop
+    }
+}
+
+// recv one reply on DGRAM sock; returns 0 ok, -1 timeout/err
+static int recv_match_dgram(int sockfd, uint16_t want_id, uint16_t want_seq,
+                            int timeout_ms, int loose_id, int verbose,
+                            double *out_rtt_ms, char *out_ip, int out_ip_sz, int *out_ttl,
+                            struct timeval start)
+{
+    struct timeval tv = { .tv_sec = timeout_ms / 1000,
+                          .tv_usec = (timeout_ms % 1000) * 1000 };
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt(SO_RCVTIMEO)"); return -1;
+    }
+
+    char buf[2048];
+    struct sockaddr_in src;
+    socklen_t slen = sizeof(src);
+
+    for (;;) {
+        ssize_t len = recvfrom(sockfd, buf, sizeof(buf), 0,
+                               (struct sockaddr*)&src, &slen);
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+            if (errno == EINTR) continue;
+            perror("recvfrom"); return -1;
+        }
+        if ((size_t)len < sizeof(struct icmphdr)) continue;
+
+        struct icmphdr *icmp = (struct icmphdr*)buf;
+        uint8_t  t  = icmp->type;
+        uint8_t  c  = icmp->code;
+        uint16_t id = ntohs(icmp->un.echo.id);
+        uint16_t sq = ntohs(icmp->un.echo.sequence);
+
+        if (verbose) {
+            char sip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &src.sin_addr, sip, sizeof(sip));
+            printf("[dbg dgm] t=%u c=%u id=0x%04x seq=%u from %s\n", t, c, id, sq, sip);
+        }
+
+        if (t == ICMP_ECHOREPLY && (loose_id || id == want_id) && sq == want_seq) {
+            struct timeval end; gettimeofday(&end, NULL);
+            double rtt = (end.tv_sec - start.tv_sec) * 1000.0 +
+                         (end.tv_usec - start.tv_usec) / 1000.0;
+            if (out_rtt_ms) *out_rtt_ms = rtt;
+            if (out_ip && out_ip_sz > 0) inet_ntop(AF_INET, &src.sin_addr, out_ip, out_ip_sz);
+            if (out_ttl) *out_ttl = -1; // not available here (could use recvmsg+IP_RECVTTL)
+            return 0;
+        }
+
+        if (t == ICMP_DEST_UNREACH) {
+            char sip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &src.sin_addr, sip, sizeof(sip));
+            printf("dest unreachable from %s (code=%u)\n", sip, c);
+            return -1;
+        }
+        if (t == ICMP_TIME_EXCEEDED) {
+            char sip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &src.sin_addr, sip, sizeof(sip));
+            printf("time exceeded from %s\n", sip);
+            return -1;
+        }
     }
 }
 
@@ -155,28 +212,39 @@ static int parse_int(const char *s, int *out) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [-c count] [-i ms] [-W ms] [-t ttl] [-A] [-v] host\n"
-        "  -c N   count (def 4)\n"
-        "  -i MS  interval (ms, def 1000)\n"
-        "  -W MS  timeout  (ms, def 5000)\n"
-        "  -t N   TTL/hops (opt)\n"
-        "  -A     loose id match (ignore ICMP id)\n"
-        "  -v     verbose (print all ICMP seen)\n", argv0);
+        "usage: %s [-c count] [-i ms] [-W ms] [-t ttl] [-A] [-v] [-M raw|dgram] [-s size] host\n"
+        "  -c N      count (def 4)\n"
+        "  -i MS     interval (ms, def 1000)\n"
+        "  -W MS     timeout  (ms, def 5000)\n"
+        "  -t N      TTL/hops (opt)\n"
+        "  -A        loose id match (ignore ICMP id)\n"
+        "  -v        verbose (print all ICMP seen)\n"
+        "  -M MODE   socket mode: raw|dgram (def raw)\n"
+        "  -s SIZE   payload size (def 56)\n", argv0);
 }
 
 int main(int argc, char **argv) {
     int count = 4, interval_ms = 1000, timeout_ms = 5000, ttl_opt = -1;
-    int loose_id = 0, verbose = 0;
+    int loose_id = 0, verbose = 0, mode_dgram = 0;
+    int payload_sz = 56;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:i:W:t:Av")) != -1) {
+    while ((opt = getopt(argc, argv, "c:i:W:t:AvM:s:")) != -1) {
         switch (opt) {
-            case 'c': if (parse_int(optarg, &count)) { usage(argv[0]); return 1; } break;
+            case 'c': if (parse_int(optarg, &count))   { usage(argv[0]); return 1; } break;
             case 'i': if (parse_int(optarg, &interval_ms)) { usage(argv[0]); return 1; } break;
-            case 'W': if (parse_int(optarg, &timeout_ms)) { usage(argv[0]); return 1; } break;
+            case 'W': if (parse_int(optarg, &timeout_ms))  { usage(argv[0]); return 1; } break;
             case 't': if (parse_int(optarg, &ttl_opt)) { usage(argv[0]); return 1; } break;
             case 'A': loose_id = 1; break;
             case 'v': verbose  = 1; break;
+            case 'M':
+                if (strcmp(optarg, "dgram") == 0) mode_dgram = 1;
+                else if (strcmp(optarg, "raw") == 0) mode_dgram = 0;
+                else { usage(argv[0]); return 1; }
+                break;
+            case 's': if (parse_int(optarg, &payload_sz) || payload_sz < 0 || payload_sz > 1400) {
+                          usage(argv[0]); return 1; }
+                      break;
             default: usage(argv[0]); return 1;
         }
     }
@@ -192,8 +260,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // raw socket (need sudo/root)
-    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    // open socket
+    int sockfd = socket(AF_INET, mode_dgram ? SOCK_DGRAM : SOCK_RAW, IPPROTO_ICMP);
     if (sockfd < 0) { perror("socket"); return 1; }
 
     // TTL
@@ -202,21 +270,20 @@ int main(int argc, char **argv) {
             perror("setsockopt(IP_TTL)");
     }
 
-    // payload
-    const char *msg = "Hello";
-    const uint8_t *payload = (const uint8_t*)msg;
-    size_t pay_len = strlen(msg);
+    // payload bytes
+    uint8_t *payload = calloc(1, (size_t)payload_sz);
+    for (int i = 0; i < payload_sz; ++i) payload[i] = (uint8_t)('A' + (i % 26));
 
     // show 1st packet bytes (debug)
     {
-        uint8_t pkt[128];
-        size_t len = build_icmp_echo((uint16_t)(getpid() & 0xFFFF), 1, payload, pay_len, pkt, sizeof(pkt));
-        printf("ICMP Echo built: type=%u code=%u id=0x%04x seq=%u payload=%zu total=%zu\n",
+        uint8_t pkt[1600];
+        size_t len = build_icmp_echo((uint16_t)(getpid() & 0xFFFF), 1, payload, payload_sz, pkt, sizeof(pkt));
+        printf("ICMP Echo built: type=%u code=%u id=0x%04x seq=%u payload=%d total=%zu\n",
             ((icmp_echo_hdr*)pkt)->type,
             ((icmp_echo_hdr*)pkt)->code,
             ntohs(((icmp_echo_hdr*)pkt)->id),
             ntohs(((icmp_echo_hdr*)pkt)->seq),
-            pay_len, len);
+            payload_sz, len);
         puts("\nhex dump:");
         hex_dump(pkt, len);
     }
@@ -228,32 +295,33 @@ int main(int argc, char **argv) {
 
     char dst_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &dst.sin_addr, dst_ip, sizeof(dst_ip));
-    printf("\nPING %s (%s): %zu data bytes\n", target, dst_ip, pay_len);
+    printf("\nPING %s (%s): %d data bytes\n", target, dst_ip, payload_sz);
 
     for (int i = 0; i < count; ++i) {
         uint16_t seq = (uint16_t)(i + 1);
         ++sent;
 
         // send pkt
-        uint8_t pkt[1500];
-        size_t pkt_len = build_icmp_echo(id, seq, payload, pay_len, pkt, sizeof(pkt));
+        uint8_t pkt[1600];
+        size_t pkt_len = build_icmp_echo(id, seq, payload, payload_sz, pkt, sizeof(pkt));
+        struct timeval start; gettimeofday(&start, NULL);
         if (sendto(sockfd, pkt, pkt_len, 0, (const struct sockaddr*)&dst, sizeof(dst)) <= 0) {
             perror("sendto");
             printf("request timeout for icmp_seq %u\n", seq);
         } else {
             double rtt = 0.0; char src_ip[INET_ADDRSTRLEN] = "?.?.?.?"; int ttl = -1;
-            int ok = recv_match(sockfd, id, seq, timeout_ms, loose_id, verbose,
-                                &rtt, src_ip, sizeof(src_ip), &ttl);
+            int ok = mode_dgram
+                ? recv_match_dgram(sockfd, id, seq, timeout_ms, loose_id, verbose,
+                                   &rtt, src_ip, sizeof(src_ip), &ttl, start)
+                : recv_match_raw  (sockfd, id, seq, timeout_ms, loose_id, verbose,
+                                   &rtt, src_ip, sizeof(src_ip), &ttl, start);
             if (ok == 0) {
                 ++recv_ok;
                 if (recv_ok == 1) { min_ms = max_ms = rtt; }
-                else {
-                    if (rtt < min_ms) min_ms = rtt;
-                    if (rtt > max_ms) max_ms = rtt;
-                }
+                else { if (rtt < min_ms) min_ms = rtt; if (rtt > max_ms) max_ms = rtt; }
                 sum_ms += rtt; sumsq_ms += rtt * rtt;
                 printf("%zu bytes from %s: icmp_seq=%u ttl=%d time=%.2f ms\n",
-                       sizeof(icmp_echo_hdr) + pay_len, src_ip, seq, ttl, rtt);
+                       sizeof(icmp_echo_hdr) + (size_t)payload_sz, src_ip, seq, ttl, rtt);
             } else {
                 printf("request timeout for icmp_seq %u\n", seq);
             }
@@ -280,6 +348,7 @@ int main(int argc, char **argv) {
     if (recv_ok > 0)
         printf("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3f ms\n", min_ms, avg, max_ms, mdev);
 
+    free(payload);
     close(sockfd);
     return 0;
 }
