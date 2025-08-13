@@ -1,5 +1,5 @@
 CC      = cc
-CFLAGS  = -O2 -Wall -Wextra -std=c2x
+CFLAGS  = -O2 -Wall -Wextra -std=c2x -D_POSIX_C_SOURCE=200809L
 TARGET  = ping
 OBJS    = ping.o
 
