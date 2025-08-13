@@ -11,7 +11,8 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <netdb.h>           // getaddrinfo
-#include <netinet/ip.h>      // iphdr
+#include <netinet/in.h>
+#include <netinet/ip.h>      // iphdr, IP_TTL, IP_RECVTTL
 #include <netinet/ip_icmp.h> // icmphdr
 #include <sys/time.h>        // gettimeofday
 #include <time.h>            // nanosleep
@@ -19,7 +20,8 @@
 #include <math.h>            // sqrt
 #include "ping.h"
 
-// 16-bit 1's complement checksum
+/* ---------- checksum + build + hex dump ---------- */
+
 uint16_t icmp_checksum(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t*)data;
     uint32_t sum = 0;
@@ -29,7 +31,6 @@ uint16_t icmp_checksum(const void *data, size_t len) {
     return (uint16_t)~sum;
 }
 
-// build ICMP Echo and write checksum
 size_t build_icmp_echo(uint16_t id, uint16_t seq,
                        const uint8_t *payload, size_t payload_len,
                        uint8_t *out, size_t out_cap) {
@@ -48,7 +49,6 @@ size_t build_icmp_echo(uint16_t id, uint16_t seq,
     return total;
 }
 
-// simple hex dump (16 bytes/line)
 void hex_dump(const void *buf, size_t len) {
     const unsigned char *p = (const unsigned char*)buf;
     for (size_t i = 0; i < len; i += 16) {
@@ -65,7 +65,8 @@ void hex_dump(const void *buf, size_t len) {
     }
 }
 
-// resolve host -> IPv4 (try inet_pton first)
+/* ---------- resolve ---------- */
+
 static int resolve_ipv4(const char *host, struct in_addr *out_addr) {
     if (inet_pton(AF_INET, host, out_addr) == 1) return 0;
     struct addrinfo hints, *res = NULL;
@@ -79,7 +80,8 @@ static int resolve_ipv4(const char *host, struct in_addr *out_addr) {
     return 0;
 }
 
-// recv one reply on RAW sock; returns 0 ok, -1 timeout/err
+/* ---------- recv helpers (RAW + DGRAM) ---------- */
+
 static int recv_match_raw(int sockfd, uint16_t want_id, uint16_t want_seq,
                           int timeout_ms, int loose_id, int verbose,
                           double *out_rtt_ms, char *out_ip, int out_ip_sz, int *out_ttl,
@@ -143,41 +145,67 @@ static int recv_match_raw(int sockfd, uint16_t want_id, uint16_t want_seq,
     }
 }
 
-// recv one reply on DGRAM sock; returns 0 ok, -1 timeout/err
 static int recv_match_dgram(int sockfd, uint16_t want_id, uint16_t want_seq,
                             int timeout_ms, int loose_id, int verbose,
                             double *out_rtt_ms, char *out_ip, int out_ip_sz, int *out_ttl,
                             struct timeval start)
 {
+    // recv timeout
     struct timeval tv = { .tv_sec = timeout_ms / 1000,
                           .tv_usec = (timeout_ms % 1000) * 1000 };
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         perror("setsockopt(SO_RCVTIMEO)"); return -1;
     }
 
-    char buf[2048];
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
+    // ensure TTL is passed via control msg
+    int one = 1;
+    if (setsockopt(sockfd, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one)) < 0) {
+        // not fatal: some kernels may not support; ttl will be -1 then
+        if (verbose) perror("setsockopt(IP_RECVTTL)");
+    }
+
+    // recvmsg buffers
+    char data[2048];
+    struct iovec iov = { .iov_base = data, .iov_len = sizeof(data) };
+    // ancillary space for TTL (int) + header
+    char cbuf[CMSG_SPACE(sizeof(int))];
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    struct sockaddr_in src; socklen_t slen = sizeof(src);
+    msg.msg_name = &src; msg.msg_namelen = slen;
+    msg.msg_iov = &iov; msg.msg_iovlen = 1;
+    msg.msg_control = cbuf; msg.msg_controllen = sizeof(cbuf);
 
     for (;;) {
-        ssize_t len = recvfrom(sockfd, buf, sizeof(buf), 0,
-                               (struct sockaddr*)&src, &slen);
+        ssize_t len = recvmsg(sockfd, &msg, 0);
         if (len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1; // timeout
             if (errno == EINTR) continue;
-            perror("recvfrom"); return -1;
+            perror("recvmsg"); return -1;
         }
         if ((size_t)len < sizeof(struct icmphdr)) continue;
 
-        struct icmphdr *icmp = (struct icmphdr*)buf;
+        struct icmphdr *icmp = (struct icmphdr*)data;
         uint8_t  t  = icmp->type;
         uint8_t  c  = icmp->code;
         uint16_t id = ntohs(icmp->un.echo.id);
         uint16_t sq = ntohs(icmp->un.echo.sequence);
 
+        // parse TTL from ancillary (IP_TTL)
+        int ttl = -1;
+        for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+             cm != NULL;
+             cm = CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_TTL) {
+                memcpy(&ttl, CMSG_DATA(cm), sizeof(ttl));
+                break;
+            }
+        }
+
         if (verbose) {
             char sip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &src.sin_addr, sip, sizeof(sip));
-            printf("[dbg dgm] t=%u c=%u id=0x%04x seq=%u from %s\n", t, c, id, sq, sip);
+            printf("[dbg dgm] t=%u c=%u id=0x%04x seq=%u from %s ttl=%d\n", t, c, id, sq, sip, ttl);
         }
 
         if (t == ICMP_ECHOREPLY && (loose_id || id == want_id) && sq == want_seq) {
@@ -186,7 +214,7 @@ static int recv_match_dgram(int sockfd, uint16_t want_id, uint16_t want_seq,
                          (end.tv_usec - start.tv_usec) / 1000.0;
             if (out_rtt_ms) *out_rtt_ms = rtt;
             if (out_ip && out_ip_sz > 0) inet_ntop(AF_INET, &src.sin_addr, out_ip, out_ip_sz);
-            if (out_ttl) *out_ttl = -1; // not available here (could use recvmsg+IP_RECVTTL)
+            if (out_ttl) *out_ttl = ttl; // now filled via control msg (or -1)
             return 0;
         }
 
@@ -200,8 +228,11 @@ static int recv_match_dgram(int sockfd, uint16_t want_id, uint16_t want_seq,
             printf("time exceeded from %s\n", sip);
             return -1;
         }
+        // else loop
     }
 }
+
+/* ---------- small utils ---------- */
 
 static int parse_int(const char *s, int *out) {
     char *end = NULL; long v = strtol(s, &end, 10);
@@ -212,20 +243,22 @@ static int parse_int(const char *s, int *out) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [-c count] [-i ms] [-W ms] [-t ttl] [-A] [-v] [-M raw|dgram] [-s size] host\n"
+        "usage: %s [-c count] [-i ms] [-W ms] [-t ttl] [-A] [-v] [-M auto|raw|dgram] [-s size] host\n"
         "  -c N      count (def 4)\n"
         "  -i MS     interval (ms, def 1000)\n"
         "  -W MS     timeout  (ms, def 5000)\n"
         "  -t N      TTL/hops (opt)\n"
         "  -A        loose id match (ignore ICMP id)\n"
         "  -v        verbose (print all ICMP seen)\n"
-        "  -M MODE   socket mode: raw|dgram (def raw)\n"
+        "  -M MODE   socket mode: auto|raw|dgram (def auto)\n"
         "  -s SIZE   payload size (def 56)\n", argv0);
 }
 
+/* ---------- main ---------- */
+
 int main(int argc, char **argv) {
     int count = 4, interval_ms = 1000, timeout_ms = 5000, ttl_opt = -1;
-    int loose_id = 0, verbose = 0, mode_dgram = 0;
+    int loose_id = 0, verbose = 0, mode_sel = 0; // 0=auto,1=raw,2=dgram
     int payload_sz = 56;
 
     int opt;
@@ -238,8 +271,9 @@ int main(int argc, char **argv) {
             case 'A': loose_id = 1; break;
             case 'v': verbose  = 1; break;
             case 'M':
-                if (strcmp(optarg, "dgram") == 0) mode_dgram = 1;
-                else if (strcmp(optarg, "raw") == 0) mode_dgram = 0;
+                if (strcmp(optarg, "auto") == 0)  mode_sel = 0;
+                else if (strcmp(optarg, "raw") == 0)   mode_sel = 1;
+                else if (strcmp(optarg, "dgram") == 0) mode_sel = 2;
                 else { usage(argv[0]); return 1; }
                 break;
             case 's': if (parse_int(optarg, &payload_sz) || payload_sz < 0 || payload_sz > 1400) {
@@ -260,11 +294,28 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // open socket
-    int sockfd = socket(AF_INET, mode_dgram ? SOCK_DGRAM : SOCK_RAW, IPPROTO_ICMP);
-    if (sockfd < 0) { perror("socket"); return 1; }
+    // open socket with fallback: try dgram in auto/explicit, else raw
+    int want_dgram = (mode_sel == 0 /*auto*/ || mode_sel == 2 /*dgram*/);
+    int used_dgram = 0;
+    int sockfd = -1;
 
-    // TTL
+    if (want_dgram) {
+        sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        if (sockfd < 0) {
+            int e = errno;
+            fprintf(stderr, "note: ICMP dgram denied (%s); falling back to RAW\n",
+                    (e == EPERM || e == EACCES) ? "EPERM/EACCES" : strerror(e));
+        } else {
+            used_dgram = 1;
+        }
+    }
+    if (sockfd < 0) {
+        sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (sockfd < 0) { perror("socket(raw)"); return 1; }
+        used_dgram = 0;
+    }
+
+    // TTL set
     if (ttl_opt > 0) {
         if (setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ttl_opt, sizeof(ttl_opt)) < 0)
             perror("setsockopt(IP_TTL)");
@@ -274,7 +325,7 @@ int main(int argc, char **argv) {
     uint8_t *payload = calloc(1, (size_t)payload_sz);
     for (int i = 0; i < payload_sz; ++i) payload[i] = (uint8_t)('A' + (i % 26));
 
-    // show 1st packet bytes (debug)
+    // show 1st pkt bytes (debug)
     {
         uint8_t pkt[1600];
         size_t len = build_icmp_echo((uint16_t)(getpid() & 0xFFFF), 1, payload, payload_sz, pkt, sizeof(pkt));
@@ -295,22 +346,23 @@ int main(int argc, char **argv) {
 
     char dst_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &dst.sin_addr, dst_ip, sizeof(dst_ip));
-    printf("\nPING %s (%s): %d data bytes\n", target, dst_ip, payload_sz);
+    printf("\nPING %s (%s): %d data bytes (%s mode)\n",
+           target, dst_ip, payload_sz, used_dgram ? "dgram" : "raw");
 
     for (int i = 0; i < count; ++i) {
         uint16_t seq = (uint16_t)(i + 1);
         ++sent;
 
-        // send pkt
         uint8_t pkt[1600];
         size_t pkt_len = build_icmp_echo(id, seq, payload, payload_sz, pkt, sizeof(pkt));
         struct timeval start; gettimeofday(&start, NULL);
+
         if (sendto(sockfd, pkt, pkt_len, 0, (const struct sockaddr*)&dst, sizeof(dst)) <= 0) {
             perror("sendto");
             printf("request timeout for icmp_seq %u\n", seq);
         } else {
             double rtt = 0.0; char src_ip[INET_ADDRSTRLEN] = "?.?.?.?"; int ttl = -1;
-            int ok = mode_dgram
+            int ok = used_dgram
                 ? recv_match_dgram(sockfd, id, seq, timeout_ms, loose_id, verbose,
                                    &rtt, src_ip, sizeof(src_ip), &ttl, start)
                 : recv_match_raw  (sockfd, id, seq, timeout_ms, loose_id, verbose,
